@@ -27,6 +27,7 @@
 #include "video.h"
 #include "joymapping.h"
 #include "support.h"
+#include "wheel.h"
 
 #define NUMDEV 30
 #define NUMPLAYERS 6
@@ -1119,7 +1120,8 @@ enum QUIRK
 	QUIRK_VCS,
 	QUIRK_JOYCON,
 	QUIRK_LIGHTGUN_CRT,
-	QUIRK_LIGHTGUN
+	QUIRK_LIGHTGUN,
+	QUIRK_WHEEL
 };
 
 typedef struct
@@ -1171,6 +1173,11 @@ typedef struct
 	bool     has_rumble;
 	uint16_t last_rumble;
 	ff_effect rumble_effect;
+
+	const wheel_info* wheel;
+	//wheel throttle/brake are combined into single axis so state of these must be saved
+	int               wheel_last_throttle;
+	int               wheel_last_brake;
 
 	int      timeout;
 	char     mac[64];
@@ -2451,6 +2458,9 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 		// paddle axis - skip from mapping
 		if ((ev->type == EV_ABS || ev->type == EV_REL) && (ev->code == 7 || ev->code == 8)) return;
 
+		// skip all analog stick mapping on wheels for which control axes are known
+		if (input[dev].quirk == QUIRK_WHEEL && is_control_axis(input[dev].wheel, ev->code)) return;
+
 		if (ev->type == EV_KEY && mapping_button>=0 && !osd_event)
 		{
 			if (mapping_type == 2)
@@ -3065,7 +3075,7 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 				// normalize to -range/2...+range/2
 				value = value - (absinfo->minimum + absinfo->maximum) / 2;
 
-				if (ev->code > 1 || !input[dev].lightgun) //lightgun has no dead zone
+				if (ev->code > 1 || !input[dev].lightgun || input[dev].quirk == QUIRK_WHEEL) //lightgun and wheel have no dead zone
 				{
 					// check the dead-zone and remove it from the range
 					hrange -= dead;
@@ -3111,23 +3121,61 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 					{
 						joy_analog(input[dev].num, 1, value);
 					}
+					else if (input[dev].quirk == QUIRK_WHEEL)
+					{
+						bool throttle_brake_updated = false;
+						if (ev->code == input[dev].wheel->steering_axis)
+						{
+							joy_analog(input[dev].num, 0, value, 0);
+						}
+						else if (ev->code == input[dev].wheel->throttle_axis)
+						{
+							input[dev].wheel_last_throttle = ev->value;
+							throttle_brake_updated = true;
+						}
+						else if (ev->code == input[dev].wheel->brake_axis)
+						{
+							input[dev].wheel_last_brake = ev->value;
+							throttle_brake_updated = true;
+						}
+						//clutch and handbrake are not mapped
+
+						if (throttle_brake_updated)
+						{
+							// Recompute value based on combined throttle/brake input
+							value = input[dev].wheel_last_throttle - input[dev].wheel_last_brake;
+							value = (value * range) / (absinfo->maximum - absinfo->minimum);
+
+							//final check to eliminate additive error
+							if (value < -range) value = -range;
+							else if (value > 127) value = 127;
+
+							joy_analog(input[dev].num, 1, value, 1);
+
+							printf("sending throttle input, value: %d\n", value);
+						}
+					}
 					else
 					{
 						int offset = (value < -1 || value>1) ? value : 0;
 						if (input[dev].stick_l[0] && ev->code == (uint16_t)input[dev].mmap[input[dev].stick_l[0]])
 						{
+							printf("sending ls input, axis: %d, value: %d\n", ev->code, value);
 							joy_analog(input[dev].num, 0, offset, 0);
 						}
 						else if (input[dev].stick_l[1] && ev->code == (uint16_t)input[dev].mmap[input[dev].stick_l[1]])
 						{
+							printf("sending ls input, axis: %d, value: %d\n", ev->code, value);
 							joy_analog(input[dev].num, 1, offset, 0);
 						}
 						else if (input[dev].stick_r[0] && ev->code == (uint16_t)input[dev].mmap[input[dev].stick_r[0]])
 						{
+							printf("sending rs input, axis: %d, value: %d\n", ev->code, value);
 							joy_analog(input[dev].num, 0, offset, 1);
 						}
 						else if (input[dev].stick_r[1] && ev->code == (uint16_t)input[dev].mmap[input[dev].stick_r[1]])
 						{
+							printf("sending rs input, axis: %d, value: %d\n", ev->code, value);
 							joy_analog(input[dev].num, 1, offset, 1);
 						}
 					}
@@ -4239,6 +4287,14 @@ int input_test(int getchar)
 							input[n].misc_flags = 0;
 						}
 
+						//Steering wheels
+						const wheel_info* wheel = get_wheel_info(input[n].vid, input[n].pid);
+						if (wheel)
+						{
+							input[n].quirk = QUIRK_WHEEL;
+							input[n].wheel = wheel;
+						}
+
 						//Arduino and Teensy devices may share the same VID:PID, so additional field UNIQ is used to differentiate them
 						if ((input[n].vid == 0x2341 || (input[n].vid == 0x16C0 && (input[n].pid>>8) == 0x4)) && strlen(uniq))
 						{
@@ -4715,10 +4771,11 @@ int input_test(int getchar)
 								if (!noabs) input_cb(&ev, &absinfo, i);
 
 								//sumulate digital directions from analog
-								if (ev.type == EV_ABS && !(mapping && mapping_type <= 1 && mapping_button < -4) && !(ev.code <= 1 && input[dev].lightgun) && input[dev].quirk != QUIRK_PDSP && input[dev].quirk != QUIRK_MSSP)
+								if (ev.type == EV_ABS && !(mapping && mapping_type <= 1 && mapping_button < -4) && !(ev.code <= 1 && input[dev].lightgun) && input[dev].quirk != QUIRK_PDSP && input[dev].quirk != QUIRK_MSSP && !(input[dev].quirk == QUIRK_WHEEL && is_control_axis(input[dev].wheel, ev.code)))
 								{
 									input_absinfo *pai = 0;
 									uint8_t axis_edge = 0;
+
 									if ((absinfo.maximum == 1 && absinfo.minimum == -1) || (absinfo.maximum == 2 && absinfo.minimum == 0))
 									{
 										if (ev.value == absinfo.minimum) axis_edge = 1;
